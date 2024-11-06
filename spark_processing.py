@@ -5,6 +5,11 @@ from pyspark.sql.functions import col, when, mean, substring, to_date, lit
 from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.pandas import get_dummies
 from pyspark.ml.stat import Correlation
+from pyspark.ml import Pipeline
+from pyspark.ml.regression import GBTRegressor, DecisionTreeRegressor, RandomForestRegressor, LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.functions import vector_to_array
+from pyspark.sql import functions as F
 from scipy.stats import boxcox
 
 
@@ -23,13 +28,14 @@ df_read = spark.read.csv("file:///home/sat3812/Downloads/US_Weather_Data_2015_20
 print(df_read.limit(10))
 
 # Limiting data size 
-df = df_read.limit(5000)
+df = df_read.limit(10000)
 
 # Extracting date, month, year from date column
 df = df.withColumn("year", substring(col("date"), 1, 4)) \
 	.withColumn("month", substring(col("date"), 5, 2)) \
 	.withColumn("day", substring(col("date"), 7, 2))
 
+predictor = df.tavg
 # Dropping unused columns
 df = df.drop("date", "stability")
 
@@ -58,7 +64,7 @@ df_encoded = df_encoded.select_dtypes(include=['float64'])
 # Converting pandas dataframe to pyspark dataframe
 df_encoded_spark = df_encoded.to_spark()
 
-feature_columns = [col for col in df_encoded_spark.columns]  # Extracting column names as a list
+feature_columns = [col for col in df_encoded_spark.columns if col != "tavg"] # [col for col in df_encoded_spark.columns]  # Extracting column names as a list
 
 # Print to check the column types
 print(df_encoded_spark.dtypes)
@@ -71,35 +77,26 @@ df_vector = assembler.transform(df_encoded_spark)
 scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withMean=True, withStd=True)
 scaler_model = scaler.fit(df_vector)
 scaled_data = scaler_model.transform(df_vector)
-
-scaled_df = scaled_data.select("scaled_features", *df_encoded.columns)
-
-scaled_df = scaled_df.withColumnRenamed("scaled_features", "features_scaled") 
+scaled_data = scaled_data.withColumn("features_array", vector_to_array("scaled_features"))
 
 
-scaled_df = scaled_data.select("scaled_features", *df_encoded_spark.columns)
+normalized_columns = [col for col in df_encoded.columns if col != "tavg"]
 
-scaled_df = scaled_df.withColumnRenamed("scaled_features", "features_scaled")
-
-normalized_columns = df_encoded_spark.columns
-		     # ['norm_st_code', 'norm_fips', 'norm_tmin', 'norm_tmax', 'norm_tavg', 
-                     # 'norm_dday_a0C', 'norm_dday_a15C', 'norm_dday_a21C', 'norm_dday_b15C', 
-                     # 'norm_dday_b21C', 'norm_year', 'norm_month', 'norm_day', 'norm_st_abb_AL']
-
-
-df_normalized = scaled_df.select('features_scaled').rdd \
-    .map(lambda row: row['features_scaled'].values.tolist()) \
-    .toDF(normalized_columns)
+df_normalized = scaled_data.select(
+    *[F.col("features_array")[i].alias(name) for i, name in enumerate(normalized_columns)]
+)
 
 # Converting pyspark df to pandas df
-scaled_df_ps = scaled_df.to_pandas_on_spark()
+scaled_df_ps = df_normalized.to_pandas_on_spark()
 
 df_normalized.show(truncate=False)
 
 
+## Extra preprocessing steps if necessary----------------------------------------------------
+
 # Calculating Correlation between columns
 
-feature_columns = df_normalized.columns 
+feature_columns = [col for col in df_normalized.columns if col != "tavg"] #df_normalized.columns 
 
 # Creating a vectorized feature
 vector_col = "features"
@@ -111,7 +108,6 @@ correlation_matrix = Correlation.corr(df_vector, vector_col).head()[0]
 
 # Convert correlation matrix to dense matrix (for easier viewing)
 correlation_matrix_dense = correlation_matrix.toArray()
-
 
 # Threshold for removing highly correlated columns
 threshold = 0.9
@@ -170,6 +166,71 @@ df_transformed_spark = spark.createDataFrame(df_transformed)
 # Show the transformed DataFrame
 print("BoxCox transformed data")
 df_transformed_spark.show()
+
+## End of extra preprocessing steps----------------------------------------------------
+
+# ML algorithms applied
+
+df_normalized = scaled_data.select(
+    F.col("tavg"),  # Retain the original `tavg` column
+    *[F.col("features_array")[i].alias(name) for i, name in enumerate(normalized_columns)]
+)
+
+feature_columns = df_normalized.columns
+
+
+def ml_pipeline(model, model_name, **kwargs):
+    assembler = VectorAssembler(inputCols = feature_columns, outputCol = "features")
+    model_init = model(featuresCol = "features", labelCol = "tavg", **kwargs)
+    
+    print(f"{model} Initialized!")
+    
+    train, test = df_normalized.randomSplit([0.8, 0.2], seed = 123)
+    pipeline = Pipeline(stages = [assembler, model_init])
+    model_fit = pipeline.fit(train)
+    predictions = model_fit.transform(test)
+
+    rmse_eval = RegressionEvaluator(labelCol = "tavg", predictionCol = "prediction", metricName = "rmse")
+    r2_eval = RegressionEvaluator(labelCol = "tavg", predictionCol = "prediction", metricName = "r2")
+
+    rmse = rmse_eval.evaluate(predictions)
+    r2 = r2_eval.evaluate(predictions)
+
+    print(f"RMSE for {model_name}: {rmse}")
+    print(f"R2 for {model_name}: {r2}\n")
+
+    return rmse, r2
+
+# Gradient Boosted Tree Regression
+gbt_rmse, gbt_r2 = ml_pipeline(GBTRegressor, "Gradient Boosted Tree Regression", maxIter = 10)
+
+# Decision Tree Regression
+dt_rmse, dt_r2 = ml_pipeline(DecisionTreeRegressor, "Decision Tree Regression")
+
+# Elastic Net (Linear Regression)
+enet_rmse, enet_r2 = ml_pipeline(LinearRegression, "Elastic Net Linear Regression", maxIter = 10, regParam = 0.3, elasticNetParam = 0.8)
+
+# Random Forest Regression
+rf_rmse, rf_r2 = ml_pipeline(RandomForestRegressor, "Random Forest Regression")
+
+
+
+print(f"RMSE for Gradient Boosted Tree Regression: {gbt_rmse}")
+print(f"R2 for Gradient Boosted Tree Regression: {gbt_r2}\n")
+
+
+print(f"RMSE for Decision Tree Regression: {dt_rmse}")
+print(f"R2 for Decision Tree Regression: {dt_r2}\n")
+
+
+print(f"RMSE for Elastic Net Linear Regression: {enet_rmse}")
+print(f"R2 for Elastic Net Linear Regression: {enet_r2}\n")
+
+print(f"RMSE for Random Forest Regression: {rf_rmse}")
+print(f"R2 for Random Forest Regression: {rf_r2}\n")
+
+
+
 
 # Stopping the spark session
 spark.stop()
